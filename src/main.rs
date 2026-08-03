@@ -6,11 +6,37 @@ use hyper::body::{Body, Bytes};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use hyper::{body::Incoming, service::Service};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
-use std::eprint;
 use std::net::SocketAddr;
+use std::{eprint, eprintln};
 use tokio::net::TcpListener;
+use tower::ServiceBuilder;
+
+#[derive(Debug, Clone)]
+pub struct Logger<S> {
+    inner: S,
+}
+impl<S> Logger<S> {
+    pub fn new(inner: S) -> Self {
+        Logger { inner }
+    }
+}
+type Req = Request<Incoming>;
+
+impl<S> Service<Req> for Logger<S>
+where
+    S: Service<Req>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+    fn call(&self, req: Req) -> Self::Future {
+        println!("processing request: {} {}", req.method(), req.uri().path());
+        self.inner.call(req)
+    }
+}
 
 async fn hello(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     Ok(Response::new(Full::new(Bytes::from("Hello World!"))))
@@ -71,24 +97,52 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install CTRL+C signal handler");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
     let listener = TcpListener::bind(addr).await?;
+    let http = http1::Builder::new();
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut signal = std::pin::pin!(shutdown_signal());
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        tokio::select! {
+            Ok((stream, _addr)) = listener.accept() => {
+                let io = TokioIo::new(stream);
+                let conn = http.serve_connection(io, service_fn(hello));
 
-        let io = TokioIo::new(stream);
+                let fut = graceful.watch(conn);
 
-        tokio::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service_fn(hello))
-                .await
-            {
-                eprint!("Error serving connection : {:?}", err);
+                tokio::spawn(async move{
+                    if let Err(e) = fut.await {
+                        eprintln!("Error serving connection : {:?}", e);
+                    }
+                });
+            },
+
+            _ = &mut signal => {
+                drop(listener);
+                eprintln!("graceful shutdown signal received");
+                break;
             }
-        });
+        }
     }
+
+    tokio::select! {
+        _ = graceful.shutdown() => {
+            eprintln!("all connections gracefully closed");
+        },
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            eprintln!("timed out wait for all connections to close");
+        }
+    }
+
+    Ok(())
 }
