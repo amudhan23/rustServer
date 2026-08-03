@@ -47,13 +47,10 @@ async fn echo(
 
             let whole_body = req.collect().await?.to_bytes();
 
-            let reversed_body = whole_body.iter()
-                .rev()
-                .cloned()
-                .collect()::<Vec<u8>>;
+            let reversed_body = whole_body.iter().rev().cloned().collect::<Vec<u8>>();
 
             Ok(Response::new(full(reversed_body)))
-        },
+        }
         _ => {
             let mut not_found = Response::new(empty());
             *not_found.status_mut() = StatusCode::NOT_FOUND;
